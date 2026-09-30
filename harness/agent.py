@@ -1,25 +1,54 @@
 import os
+import json
 from dotenv import load_dotenv
 from openai import OpenAI
+from harness.tools import registry
 
-# Load OPENAI_API_KEY from .env into the environment
+# Load API keys from .env into the environment
 # override=True ensures a real key in .env wins over a stale/placeholder
-# OPENAI_API_KEY that may already be set in the shell/system environment.
+# key that may already be set in the shell/system environment.
 load_dotenv(override=True)
 
-# The model we'll use throughout the course
-MODEL = "gpt-4o-mini"
+# Pick the provider with LLM_PROVIDER=kimi or LLM_PROVIDER=openai (default: openai)
+PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
 
-# One client, reused for every call
-client = OpenAI()
+if PROVIDER == "kimi":
+    MODEL = os.getenv("KIMI_MODEL", "kimi-k3")
+    client = OpenAI(
+        api_key=os.getenv("KIMI_API_KEY"),
+        base_url="https://api.moonshot.ai/v1",
+    )
+    EXTRA_BODY = {"thinking": {"type": "disabled"}} 
+else:
+    MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    EXTRA_BODY = {}
 
+
+SYSTEM_PROMPT = """ You are a coding assistant running in a terminal, helping a developer with software engineering tasks.
+
+Be concise. Prefer short, direct answers over long ones. When the user asks for code, return the code with minimal explanation unless they ask for more.
+
+When returning code, use fenced code blocks and specify the language.
+
+You have access to five filesystem tools — read, write, list, mkdir, delete — operating on a workspace directory. Use them whenever a task involves reading, modifying, or organizing files. Paths are relative to
+the workspace root. Prefer reading and writing real files over describing them in conversation.
+
+You also have eight git tools — git_status, git_diff, git_log, git_commit, git_checkout, git_branch, git_remote, git_push — for versioning your work. The workspace is
+already initialized as a git repo. Use git to:
+- Commit frequently. Small, focused commits are easier to roll back.
+- Commit before doing anything risky (large rewrites, deleting files, restructuring). A commit before the risky step gives you a recovery point.
+- Write meaningful commit messages — describe what changed and why, in the present tense (e.g., "add user authentication module").
+- Branch experiments. When trying an alternative approach, create a branch first so the main line of work stays intact.
+- Before pushing, confirm a remote named "origin" is configured (git_remote). Push only the current branch (git_push) — force-pushing is not available.
+"""
 
 def run():
     """Run the agent's conversation loop until the user quits."""
 
     # The conversation history. This is the entire memory of the agent.
     # Every turn, we append to it and send the whole thing to the model.
-    messages = []
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     print("Agent ready. Type 'quit' or 'exit' to leave.\n")
 
@@ -39,20 +68,50 @@ def run():
         # 3. Append the user's message to the history
         messages.append({"role": "user", "content": user_input})
 
-        # 4. Call the model with the full conversation so far
+        # 4. Call the model with the full conversation so far and available tools. 
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
+            extra_body=EXTRA_BODY,
+            tools=registry.get_schemas()
         )
+        
+        message = response.choices[0].message                              
+        # If the model asked for a tool call, handle it before producing    
+        # the user-facing reply. Minimum-viable dispatch: one round only.
+        if message.tool_calls:
+            # Step 1: record the model's tool-call message in history so the
+            # upcoming tool-result messages have something to reference.
+            messages.append(message)
 
-        # 5. Extract the assistant's reply
-        assistant_message = response.choices[0].message.content
+            # Step 2: run each requested tool and append its result to history,
+            # using the matching tool_call_id so the model can pair them up.
+            for call in message.tool_calls:
+                arguments = json.loads(call.function.arguments)
+                result = registry.dispatch(call.function.name, arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result,
+                })
 
-        # 6. Append the assistant's reply to the history
-        messages.append({"role": "assistant", "content": assistant_message})
+            # Step 3: re-call the model now that the tool results are in
+            # context. This second call produces the model's final text reply.
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=registry.get_schemas(),
+            )
+            message = response.choices[0].message
 
-        # 7. Show the user
-        print(f"\nagent > {assistant_message}\n")
+        # By here, `message` is the model's final text response for this turn —
+        # either from the first call (no tools needed) or the second (after dispatch).
+        assistant_text = message.content or "(no text response - used tools only)"
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        print(f"\nagent > {assistant_text}\n")
+
+       
 
 
 if __name__ == "__main__":
